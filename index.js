@@ -1,237 +1,200 @@
-const express     = require('express');
-const admin       = require('firebase-admin');
-const bodyParser  = require('body-parser');
-const cors        = require('cors');
+/**
+ * Wevlo Push Server
+ * - Android অ্যাপের FCM token রেজিস্টার করে (Firestore এ সেভ হয়, তাই Render restart এ হারায় না)
+ * - DATA-ONLY মেসেজ পাঠায়: data: { title, body, imageUrl? }
+ *
+ * Endpoints:
+ *   GET  /                      health check
+ *   POST /register-app          { appId, password? }                       (ADMIN)
+ *   POST /register-token        { token, appId, userAgent?, password? }    (অ্যাপ থেকে)
+ *   POST /send-all              { appId, title, body, imageUrl? }          (ADMIN)
+ *   POST /send                  { token, title, body, imageUrl? }          (ADMIN)
+ *   GET  /stats/:appId          টোকেন সংখ্যা                                 (ADMIN)
+ *
+ * ADMIN = header  x-admin-key: <ADMIN_KEY env>   (ADMIN_KEY সেট না থাকলে খোলা থাকবে)
+ */
+const express = require("express");
+const cors = require("cors");
+const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
+const admin = require("firebase-admin");
 
+// ───────── Firebase Admin init ─────────
+function loadServiceAccount() {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    return JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  }
+  const p = path.join(__dirname, "serviceAccountKey.json");
+  return JSON.parse(fs.readFileSync(p, "utf8"));
+}
+
+admin.initializeApp({ credential: admin.credential.cert(loadServiceAccount()) });
+const db = admin.firestore();
+const messaging = admin.messaging();
+
+const APPS = db.collection("push_apps");
+const TOKENS = db.collection("push_tokens");
+
+// ───────── Helpers ─────────
+const ADMIN_KEY = process.env.ADMIN_KEY || "";
+if (!ADMIN_KEY) console.warn("⚠️  ADMIN_KEY সেট করা নেই — send endpoint গুলো সবার জন্য খোলা!");
+
+const sha = (s) => crypto.createHash("sha256").update(s).digest("hex");
+
+function safeEqual(a, b) {
+  const x = Buffer.from(String(a));
+  const y = Buffer.from(String(b));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(password, salt, 32).toString("hex");
+  return `${salt}:${hash}`;
+}
+
+function checkPassword(password, stored) {
+  const [salt, hash] = String(stored).split(":");
+  if (!salt || !hash) return false;
+  const test = crypto.scryptSync(String(password || ""), salt, 32).toString("hex");
+  return safeEqual(test, hash);
+}
+
+function requireAdmin(req, res, next) {
+  if (!ADMIN_KEY) return next();
+  if (safeEqual(req.get("x-admin-key") || "", ADMIN_KEY)) return next();
+  return res.status(401).json({ error: "Unauthorized" });
+}
+
+const wrap = (fn) => (req, res) =>
+  fn(req, res).catch((e) => {
+    console.error(e);
+    res.status(500).json({ error: e.message || "Server error" });
+  });
+
+function buildData({ title, body, imageUrl }) {
+  const data = { title: String(title || "Wevlo"), body: String(body || "") };
+  if (imageUrl) data.imageUrl = String(imageUrl);
+  return data; // FCM data এর সব value অবশ্যই string
+}
+
+const DEAD_TOKEN_CODES = new Set([
+  "messaging/registration-token-not-registered",
+  "messaging/invalid-registration-token",
+]);
+
+// ───────── App ─────────
 const app = express();
 app.use(cors());
-app.use(bodyParser.json());
+app.use(express.json({ limit: "100kb" }));
 
-// ── Firebase Admin initialize ──
-const serviceAccount = require('./serviceAccountKey.json');
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
-});
+app.get("/", (req, res) => res.json({ ok: true, service: "wevlo-push-server" }));
 
-const db = admin.firestore();
+// অ্যাপ রেজিস্টার (পাসওয়ার্ড ঐচ্ছিক)
+app.post("/register-app", requireAdmin, wrap(async (req, res) => {
+  const { appId, password } = req.body || {};
+  if (!appId) return res.status(400).json({ error: "appId দরকার" });
 
-// ════════════════════════════════════════════════════════════
-// HELPERS
-// ════════════════════════════════════════════════════════════
+  const doc = { createdAt: admin.firestore.FieldValue.serverTimestamp() };
+  if (password) doc.passwordHash = hashPassword(String(password));
+  await APPS.doc(appId).set(doc, { merge: true });
 
-function isValidAppId(appId) {
-  return appId && /^[a-zA-Z0-9._\-]{3,100}$/.test(appId);
-}
+  res.json({ ok: true, appId, protected: !!password });
+}));
 
-function tokenDocId(token) {
-  return token.replace(/[^a-zA-Z0-9]/g, '').substring(0, 20);
-}
+// অ্যাপ থেকে token রেজিস্টার
+app.post("/register-token", wrap(async (req, res) => {
+  const { token, appId, userAgent, password } = req.body || {};
+  if (!token || !appId) return res.status(400).json({ error: "token ও appId দরকার" });
 
-function devicesRef(appId) {
-  return db.collection('push_tokens').doc(appId).collection('devices');
-}
+  const appRef = APPS.doc(appId);
+  const appSnap = await appRef.get();
 
-function appMetaRef(appId) {
-  return db.collection('push_app_meta').doc(appId);
-}
+  if (!appSnap.exists) {
+    // প্রথমবার — পাসওয়ার্ডবিহীন অ্যাপ হিসেবে অটো-তৈরি
+    await appRef.set({ createdAt: admin.firestore.FieldValue.serverTimestamp() });
+  } else {
+    const hash = appSnap.data().passwordHash;
+    if (hash && !checkPassword(password, hash)) {
+      return res.status(403).json({ error: "ভুল পাসওয়ার্ড" });
+    }
+  }
 
-// ════════════════════════════════════════════════════════════
-// ROUTES
-// ════════════════════════════════════════════════════════════
+  await TOKENS.doc(sha(token)).set(
+    {
+      token: String(token),
+      appId: String(appId),
+      userAgent: String(userAgent || ""),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
 
-app.get('/', (req, res) => {
-  res.send('Wevlo Push Notification Server is Running!');
-});
+  res.json({ ok: true });
+}));
 
-// ── Debug: দেখো এখন সার্ভারে কোন credential লোড হয়েছে ──
-// GET /debug
-app.get('/debug', (req, res) => {
-  res.json({
-    project_id:      serviceAccount.project_id,
-    client_email:    serviceAccount.client_email,
-    private_key_id:  serviceAccount.private_key_id,
-    private_key_len: (serviceAccount.private_key || '').length
-  });
-});
+// অ্যাপের সব ডিভাইসে পাঠান
+app.post("/send-all", requireAdmin, wrap(async (req, res) => {
+  const { appId, title, body, imageUrl } = req.body || {};
+  if (!appId) return res.status(400).json({ error: "appId দরকার" });
+  if (!title && !body) return res.status(400).json({ error: "title বা body দরকার" });
 
-// ── Debug: appId রেজিস্টার্ড আছে কিনা এবং কয়টা token আছে ──
-// GET /app-status?appId=com.myapp.xyz
-app.get('/app-status', async (req, res) => {
-  const { appId } = req.query;
-  if (!isValidAppId(appId)) return res.status(400).json({ success: false, error: 'valid appId required' });
+  const snap = await TOKENS.where("appId", "==", appId).get();
+  const entries = snap.docs.map((d) => ({ id: d.id, token: d.data().token }));
+  if (entries.length === 0) return res.json({ ok: true, sent: 0, failed: 0, removed: 0 });
 
-  try {
-    const metaDoc  = await appMetaRef(appId).get();
-    const tokenSnap = await devicesRef(appId).get();
-    res.json({
-      success:      true,
-      appId,
-      registered:   metaDoc.exists,
-      registeredAt: metaDoc.exists ? metaDoc.data().registeredAt : null,
-      tokenCount:   tokenSnap.size
+  const data = buildData({ title, body, imageUrl });
+  let sent = 0, failed = 0;
+  const dead = [];
+
+  for (let i = 0; i < entries.length; i += 500) {
+    const chunk = entries.slice(i, i + 500);
+    const result = await messaging.sendEachForMulticast({
+      tokens: chunk.map((e) => e.token),
+      data,
+      android: { priority: "high" },
     });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    sent += result.successCount;
+    failed += result.failureCount;
+    result.responses.forEach((r, idx) => {
+      if (!r.success && DEAD_TOKEN_CODES.has(r.error && r.error.code)) dead.push(chunk[idx].id);
+    });
   }
-});
 
-// ── Register App (APK build থেকে password সেট হয়) ──
-// POST /register-app  { appId, password }
-app.post('/register-app', async (req, res) => {
-  const { appId } = req.body;
-  if (!isValidAppId(appId)) return res.status(400).json({ success: false, error: 'valid appId required' });
-
-  try {
-    const ref = appMetaRef(appId);
-    const doc = await ref.get();
-
-    await ref.set({
-      appId,
-      registeredAt: doc.exists ? doc.data().registeredAt : Date.now(),
-      updatedAt:    Date.now()
-    }, { merge: true });
-
-    console.log(`[${appId}] App registered/updated`);
-    res.json({ success: true, message: 'app registered' });
-  } catch (e) {
-    console.error('Register-app error:', e.message);
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// ── Register Token (APK থেকে আসে) ──
-// POST /register-token  { token, appId, userAgent?, password? }
-app.post('/register-token', async (req, res) => {
-  const { token, appId, userAgent } = req.body;
-
-  if (!token)               return res.status(400).json({ success: false, error: 'token required' });
-  if (!isValidAppId(appId)) return res.status(400).json({ success: false, error: 'valid appId required' });
-
-  try {
-    await devicesRef(appId).doc(tokenDocId(token)).set({
-      token,
-      appId,
-      userAgent:    userAgent || '',
-      registeredAt: Date.now(),
-      updatedAt:    Date.now()
-    }, { merge: true });
-
-    console.log(`[${appId}] Token registered: ${token.substring(0, 20)}...`);
-    res.json({ success: true });
-  } catch (e) {
-    console.error('Register error:', e.message);
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// ── Get tokens by appId (password required) ──
-// GET /tokens?appId=com.myapp.xyz&password=xxx
-app.get('/tokens', async (req, res) => {
-  const { appId } = req.query;
-  if (!isValidAppId(appId)) return res.status(400).json({ success: false, error: 'valid appId required' });
-
-  // Password check disabled — সব request password ছাড়াই allow
-
-  try {
-    const snap   = await devicesRef(appId).get();
-    const tokens = snap.docs.map(d => ({
-      token:        d.data().token,
-      registeredAt: d.data().registeredAt,
-      userAgent:    d.data().userAgent || ''
-    }));
-    res.json({ success: true, appId, count: tokens.length, tokens });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// ── Send to one token (password required) ──
-// POST /send-notification  { token, title, body, password, appId }
-app.post('/send-notification', async (req, res) => {
-  const { token, title, body, imageUrl } = req.body;
-  if (!token) return res.status(400).json({ success: false, error: 'token required' });
-
-  // Password check disabled — password ছাড়াই allow
-
-  try {
-    const t = title || 'Notification';
-    const b = body  || '';
-
-    const message = {
-      token,
-      data: { title: t, body: b, ...(imageUrl ? { imageUrl } : {}) },
-      android: { priority: 'high' }
-    };
-
-    const msgId = await admin.messaging().send(message);
-    res.json({ success: true, messageId: msgId });
-  } catch (e) {
-    console.error('Send error:', e.message);
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// ── Send to ALL tokens of an appId (password required) ──
-// POST /send-all  { appId, title, body, password }
-app.post('/send-all', async (req, res) => {
-  const { appId, title, body, imageUrl } = req.body;
-  if (!isValidAppId(appId)) return res.status(400).json({ success: false, error: 'valid appId required' });
-
-  // Password check disabled — password ছাড়াই allow
-
-  try {
-    const snap = await devicesRef(appId).get();
-    if (snap.empty) return res.json({ success: false, error: 'No tokens found for this app' });
-
-    const tokens = snap.docs.map(d => d.data().token).filter(Boolean);
-    const t = title || 'Notification';
-    const b = body  || '';
-    const messages = tokens.map(token => ({
-      token,
-      data: { title: t, body: b, ...(imageUrl ? { imageUrl } : {}) },
-      android: { priority: 'high' }
-    }));
-
-    const result = await admin.messaging().sendEach(messages);
-    console.log(`[${appId}] Sent: ${result.successCount} ok, ${result.failureCount} failed`);
-
-    // invalid token গুলো Firestore থেকে delete করো
+  // মৃত token মুছে ফেলা
+  for (let i = 0; i < dead.length; i += 400) {
     const batch = db.batch();
-    let removed = 0;
-    result.responses.forEach((r, i) => {
-      if (!r.success) { batch.delete(snap.docs[i].ref); removed++; }
-    });
-    if (removed > 0) await batch.commit();
-
-    res.json({
-      success:      true,
-      appId,
-      total:        tokens.length,
-      successCount: result.successCount,
-      failureCount: result.failureCount
-    });
-  } catch (e) {
-    console.error('Send-all error:', e.message);
-    res.status(500).json({ success: false, error: e.message });
+    dead.slice(i, i + 400).forEach((id) => batch.delete(TOKENS.doc(id)));
+    await batch.commit();
   }
-});
 
-// ── Delete a token (password required) ──
-// DELETE /token?appId=com.myapp&token=xxx&password=yyy
-app.delete('/token', async (req, res) => {
-  const { appId, token } = req.query;
-  if (!isValidAppId(appId) || !token) return res.status(400).json({ success: false, error: 'appId and token required' });
+  res.json({ ok: true, total: entries.length, sent, failed, removed: dead.length });
+}));
 
-  // Password check disabled — password ছাড়াই allow
+// একটি নির্দিষ্ট token এ পাঠান
+app.post("/send", requireAdmin, wrap(async (req, res) => {
+  const { token, title, body, imageUrl } = req.body || {};
+  if (!token) return res.status(400).json({ error: "token দরকার" });
 
   try {
-    await devicesRef(appId).doc(tokenDocId(token)).delete();
-    res.json({ success: true });
+    const id = await messaging.send({
+      token,
+      data: buildData({ title, body, imageUrl }),
+      android: { priority: "high" },
+    });
+    res.json({ ok: true, messageId: id });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    if (DEAD_TOKEN_CODES.has(e.code)) await TOKENS.doc(sha(token)).delete().catch(() => {});
+    res.status(400).json({ error: e.message, code: e.code });
   }
-});
+}));
 
-// ════════════════════════════════════════════════════════════
-const PORT = process.env.PORT || 7860;
-app.listen(PORT, () => console.log(`Wevlo Push Server running on port ${PORT}`));
+// কতগুলো ডিভাইস রেজিস্টার আছে
+app.get("/stats/:appId", requireAdmin, wrap(async (req, res) => {
+  const snap = await TOKENS.where("appId", "==", req.params.appId).count().get();
+  res.json({ appId: req.params.appId, tokens: snap.data().count });
+}));
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`Push server running on :${PORT}`));
